@@ -150,6 +150,8 @@ jobs:
       - name: Publish cn-latest
         env:
           GH_TOKEN: ${{ github.token }}
+          # 仓库里还有 upstream 远端，别让 gh 把发布推到上游去。
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release delete cn-latest --yes --cleanup-tag || true
           {
