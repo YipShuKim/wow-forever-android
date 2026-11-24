@@ -1,0 +1,167 @@
+# 国服版自动构建：跟上上游 + 打国服补丁 + 出 APK。
+#
+# 本仓库（fork）的 main 只保存两样东西：patches/ 里的国服补丁和这条工作流。每次运行：
+#   1. 把 upstream/main 合并进来并 push（上游发新版后自动跟进；冲突则失败并指出文件）
+#   2. 用 git apply -3 把国服补丁打到上游源码上（打不上直接失败，不产出半残包）
+#   3. 编译 ARM64 浏览器登录助手、跑单测、出 debug 包
+#   4. 发布滚动 Release cn-latest
+#
+# Secrets（Settings → Secrets and variables → Actions）：
+#   CN_KEYSTORE_BASE64  签名库（base64 -i keystore 或 base64 -w0 keystore）
+#   CN_STORE_PASSWORD   库口令
+#   CN_KEY_ALIAS        key 别名
+#   CN_KEY_PASSWORD     key 口令
+# 没配签名库时会退回 CI 临时 debug 签名：能装，但签名每次都变，无法覆盖安装旧版本。
+name: CN build (国服补丁)
+
+on:
+  schedule:
+    # 每天 UTC 03:00（北京时间 11:00）拉一次上游
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cn-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Merge upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/jaredgei/wow-forever-android.git
+          git fetch --no-tags upstream main
+          upstream_sha=$(git rev-parse upstream/main)
+          echo "UPSTREAM_SHA=$upstream_sha" >> "$GITHUB_ENV"
+          echo "upstream=$upstream_sha"
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "已经包含上游最新提交"
+          else
+            git merge --no-edit -m "Merge upstream ${upstream_sha:0:10}" upstream/main
+            git push origin HEAD:main
+          fi
+
+      - name: Apply the China patch
+        run: |
+          git apply -3 --verbose --whitespace=nowarn patches/0001-add-china-cn-region-support.patch
+          # 版本号留在上游源码里（补丁不碰它），在这里追加 -cn，减少补丁冲突面。
+          sed -i 's/^        versionName = "\(.*\)"/        versionName = "\1-cn"/' app/build.gradle.kts
+          grep -nE 'applicationId|versionName|CN_EDITION' app/build.gradle.kts
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install SDK components
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" "build-tools;35.0.0" "ndk;27.3.13750724" "cmake;3.22.1" > /dev/null
+
+      - name: Fetch bundled components
+        run: tools/fetch_components.sh
+
+      - name: Remove 32-bit Windows files from Proton
+        run: |
+          command -v zstd > /dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq zstd > /dev/null; }
+          python3 tools/trim_proton_i386.py app/src/main/assets/bundled_components/proton-11.0-90624-arm64ec.wcp
+
+      - name: Build the browser-login helper
+        env:
+          LLVM_MINGW: llvm-mingw-20261104-ucrt-ubuntu-22.04-x86_64
+          LLVM_MINGW_SHA256: 919380403de87dca3c581c2053230cd298af5e891286628ba0613b7fed370926
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/llvm-mingw.tar.xz" \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/20261104/$LLVM_MINGW.tar.xz"
+          echo "$LLVM_MINGW_SHA256  $RUNNER_TEMP/llvm-mingw.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/llvm-mingw.tar.xz" -C "$RUNNER_TEMP"
+          sh tools/wow-session-bridge/build.sh "$RUNNER_TEMP/$LLVM_MINGW/bin/aarch64-w64-mingw32-clang" \
+            app/src/main/assets/wow-session-bridge.exe
+          sha256sum app/src/main/assets/wow-session-bridge.exe
+
+      # Secrets Gradle 插件没有 local.properties 会拒绝配置工程。
+      - name: Write local.properties
+        run: echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+      - name: Set up signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.CN_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.CN_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.CN_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.CN_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            mkdir -p app/keystores
+            echo "$KEYSTORE_BASE64" | base64 -d > app/keystores/release.jks
+            {
+              echo "storeFile=keystores/release.jks"
+              echo "storePassword=$STORE_PASSWORD"
+              echo "keyAlias=$KEY_ALIAS"
+              echo "keyPassword=$KEY_PASSWORD"
+            } > app/keystores/keystore.properties
+            echo "SIGNING=固定签名库" >> "$GITHUB_ENV"
+          else
+            echo "::warning::CN_KEYSTORE_BASE64 未配置，本次用 CI 临时 debug 签名（无法覆盖安装旧版本）"
+            echo "SIGNING=临时 debug 签名" >> "$GITHUB_ENV"
+          fi
+
+      - name: Unit tests
+        run: ./gradlew --no-daemon :app:testModernDebugUnitTest
+
+      - name: Build
+        run: ./gradlew --no-daemon :app:assembleModernDebug
+
+      - name: Package
+        run: |
+          version=$(sed -n 's/^ *versionName = "\(.*\)"/\1/p' app/build.gradle.kts)
+          apk=app/build/outputs/apk/modern/debug/app-modern-debug.apk
+          name="WoW-Forever-CN-${version}-$(git rev-parse --short HEAD).apk"
+          cp "$apk" "$name"
+          sha256sum "$name" > SHA256SUMS.txt
+          echo "APK_NAME=$name" >> "$GITHUB_ENV"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$name"
+
+      - name: Remove signing files
+        if: always()
+        run: rm -rf app/keystores/release.jks app/keystores/keystore.properties
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cn-apk
+          path: |
+            WoW-Forever-CN-*.apk
+            SHA256SUMS.txt
+
+      - name: Publish cn-latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete cn-latest --yes --cleanup-tag || true
+          {
+            printf '上游提交：`%s`\n\n' "$UPSTREAM_SHA"
+            printf '国服补丁：`patches/0001-add-china-cn-region-support.patch`\n\n'
+            printf -- '- 包名 `app.wowforever.cn`，可与国际版共存\n'
+            printf -- '- 首次启动：允许"所有文件访问" → 下载并安装 → 浏览器登录（网易账号）\n'
+            printf -- '- 签名：%s\n' "$SIGNING"
+          } > notes.md
+          gh release create cn-latest "$APK_NAME" SHA256SUMS.txt \
+            patches/0001-add-china-cn-region-support.patch \
+            --title "国服版 $APK_NAME" \
+            --notes-file notes.md \
+            --target "$(git rev-parse HEAD)" \
+            --prerelease
